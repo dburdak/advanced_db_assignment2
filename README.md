@@ -13,14 +13,7 @@ SELECT
     mean_exec_time,
     rows
 FROM pg_stat_statements
-where query ILIKE 'SELECT%'
-    AND (
-        query ILIKE '%customers%'
-        OR query ILIKE '%orders%'
-        OR query ILIKE '%order_items%'
-        OR query ILIKE '%customer_events_wide%'
-    ) and calls >= 3
-ORDER BY mean_exec_time DESC, calls desc
+ORDER BY total_exec_time DESC, mean_exec_time desc, calls desc
 LIMIT 100;
 ```
 
@@ -68,15 +61,17 @@ Execution Time: 82.452 ms
 
 The database executes a Parallel Seq Scan across the entire customer_events_wide table. For a 7-day lookback window, it processes and subsequently discards **65,432 rows** via a filter condition, spending 50.340 ms just on physical disk reads.
 
+**Indexing over Partitioning:** At the current data volume, implementing table partitioning for `customer_events_wide` introduces unnecessary architectural complexity and query planner overhead. An index is highly efficient and perfectly adequate for the current scale. However, as historical event data grows into millions of rows, implementing range partitioning on `event_time` (e.g., daily or weekly partitions) should be revisited as a future-proof strategy to maintain optimal index sizes and enable instant data pruning.
+
 ### Final Engineering Decisions
 
-1. **Implement Table Partitioning:** Since this is a high-volume event/log table, partition `customer_events_wide` by range on the `event_time` column (e.g., daily or monthly partitions). This ensures the engine completely ignores historical chunks of data and scans only the active time-slice.
+1. **In the future we should implement Table Partitioning:** Since this is a high-volume event/log table, partition `customer_events_wide` by range on the `event_time` column (e.g., daily or monthly partitions). This ensures the engine completely ignores historical chunks of data and scans only the active time-slice. 
 2. **Deploy a Tailored Composite Index:** To eliminate the sorting overhead and accelerate the filter, create a composite B-Tree index:
 
-| **Metric** | **Before Optimization** | with composite index | with patitioning | **Status / Delta** |
-| --- | --- | --- | --- | --- |
-| **Execution Time** | 82.452 ms | 17.821 ms |  | `[TBD]` |
-| **Rows Filtered (Waste)** | 65,432 | - |  | `[TBD]` |
+| **Metric** | **Before Optimization** | with composite index |
+| --- | --- | --- |
+| **Execution Time** | 82.452 ms | 17.821 ms |
+| **Rows Filtered (Waste)** | 65,432 | - |
 
 2.
 
@@ -108,10 +103,12 @@ the amount of filtered rows depends on quantity number placed in where condition
 
 1. **Deploy a Dedicated B-Tree Index:** When the index ON order_items (quantity) is in place, PostgreSQL can completely bypass loading the underlying table data blocks from disk. Instead, it will perform an `Index Only Scan`, traversing the lean index structure to isolate and count the target pointers directly, converting a `30 ms` operation into a near-instantaneous sub-millisecond lookup.
 
-| **Metric** | **Before Optimization** | with index | **Status / Delta** |
-| --- | --- | --- | --- |
-| **Execution Time** | 30.189 ms | `10.853 ms` | `[TBD]` |
-| **Rows Filtered (Waste)** | 126,080 | 0 | `[TBD]` |
+| **Metric** | **Before Optimization** | with index |
+| --- | --- | --- |
+| **Execution Time** | 30.189 ms | `10.853 ms` |
+| **Rows Filtered (Waste)** | 126,080 | 0 |
+
+It is important that if the `quantity > 7` condition returns a large percentage of the table (e.g., >30%), the PostgreSQL planner may intentionally bypass the index. In such high-selectivity scenarios, reverting to a Sequential Scan is structurally cheaper than incurring the random I/O overhead associated with massive index lookups.
 
 3.
 
@@ -154,7 +151,7 @@ need the index on the event_time or partitioning in customer_events_wide table a
 
 so much time spent on the parallel scan on customer_events_wide e to filter by event_time 27 milliseconds, so we should create index on this column or/and partition on that column. 
 
-on status scanning database spend only 3 seconds, so patitioning or/and index also can speed up.
+on status scanning database spend only 3 milliseconds, so patitioning or/and index also can speed up.
 
 ### Final Engineering Decisions
 
@@ -163,10 +160,10 @@ on status scanning database spend only 3 seconds, so patitioning or/and index al
 idx_customers_status ON customers (status);
 idx_customer_events_time ON customer_events_wide (event_time);
 
-| **Metric** | **Before Optimization** | with cover index from query1 | with index on status | **Status / Delta** |
-| --- | --- | --- | --- | --- |
-| **Execution Time** | 54.650 ms | `5.339 ms` | `6.484 ms` | `[TBD]` |
-| **Rows Filtered (Waste)** | 78,850 *(Total)* | `13413` | 0 | `[TBD]` |
+| **Metric** | **Before Optimization** | with cover index from query1 | with index on status |
+| --- | --- | --- | --- |
+| **Execution Time** | 54.650 ms | `5.339 ms` | `6.484 ms` |
+| **Rows Filtered (Waste)** | 78,850 *(Total)* | `13413` | 0 |
 
 so because of the optimisation by index idx_customer_events_time_group there is no need to create another index idx_customer_events_time proposed by me before, it gives no optimisation in time.
 
@@ -193,15 +190,18 @@ The database uses a full `Seq Scan` to inspect all `120,000` rows within `orders
 
 ### Final Engineering Decisions
 
-1. **Deploy a Pattern-Optimized Composite Index:** Standard B-Tree indexes cannot properly interpret prefix wildcard matching (`LIKE 'North%'`) under default non-C locales. A dedicated operator class must be specified:SQL
-    
-    Placing `status` first provides an exact-match equality anchor (`=`). Appending `delivery_city` with `varchar_pattern_ops` allows the B-Tree structure to map preﬁx ranges natively, completely eliminating the full `Seq Scan` and reducing block access to only matching rows.
-    
-    | **Metric** | **Before Optimization** | **After Optimization** | **Status / Delta** |
-    | --- | --- | --- | --- |
-    | **Execution Time** | 12.206 ms | 1.992 ms | `[TBD]` |
-    | **Rows Filtered (Waste)** | 118,264 | 0 | `[TBD]` |
-    
+1. **Deploy a Pattern-Optimized Composite Index:** Standard B-Tree indexes cannot properly interpret prefix wildcard matching (`LIKE 'North%'`) under default non-C locales. A dedicated operator class must be specified:
+
+```sql
+CREATE INDEX idx_orders_status_city ON orders (status, delivery_city varchar_pattern_ops);
+```
+
+Placing `status` first provides an exact-match equality anchor (`=`). Appending `delivery_city` with `varchar_pattern_ops` allows the B-Tree structure to map preﬁx ranges natively, completely eliminating the full `Seq Scan` and reducing block access to only matching rows.
+
+| **Metric** | **Before Optimization** | **After Optimization** |
+| --- | --- | --- |
+| **Execution Time** | 12.206 ms | 1.992 ms |
+| **Rows Filtered (Waste)** | 118,264 | 0 |
 
 5.
 
@@ -250,12 +250,12 @@ The query is designed to calculate historical metrics across 100% of rows in bot
 
 ### Final Engineering Decisions
 
-1. **Implement a Materialized View:** Because the runtime is directly tied to total data volume, standard indexes offer no remedy. The computation should be offloaded into a cache
+1. **Implement a Materialized View:** Because the runtime is directly tied to total data volume, standard indexes offer no remedy. The computation should be offloaded into a cache. To maintain database availability, the view must be updated asynchronously using `REFRESH MATERIALIZED VIEW CONCURRENTLY`, scheduled strictly during off-peak hours.
 
-| **Metric** | **Before Optimization** | select materealized view | **Status / Delta** |
-| --- | --- | --- | --- |
-| **Execution Time** | 26.171 ms | 0.024 ms | `[TBD]` |
-| **Rows Filtered (Waste)** | 0 *(100% scan)* | 0 | `[TBD]` |
+| **Metric** | **Before Optimization** | select materealized view |
+| --- | --- | --- |
+| **Execution Time** | 26.171 ms | 0.024 ms |
+| **Rows Filtered (Waste)** | 0 *(100% scan)* | 0 |
 
 6.
 
@@ -310,14 +310,20 @@ idx_orders_customer_id ON orders (customer_id);
 
 This pair of indexes shifts the optimal join strategy from a broad `Hash Join` to a targeted `Nested Loop Join`. The database will first pinpoint the subset of target customers via `idx_customers_status`, and then perform swift, pinpoint index lookups into `orders` via the foreign key index, avoiding the need to process all 120,000 orders.
 
-| **Metric** | **Before Optimization** | with status index | with index customer_id | **Status / Delta** |
-| --- | --- | --- | --- | --- |
-| **Execution Time** | 16.303 ms | 15.322 ms | 15.322 ms | `[TBD]` |
-| **Rows Filtered (Waste)** | 133,413 *(Total)* | 0 | 0 | `[TBD]` |
+| **Metric** | **Before Optimization** | with status index | with index customer_id |
+| --- | --- | --- | --- |
+| **Execution Time** | 16.303 ms | 15.322 ms | 15.322 ms |
+| **Rows Filtered (Waste)** | 133,413 *(Total)* | 0 | 0 |
 
 Although the planner currently chooses a hash join due to the high sampling percentage (index tipping point), the idx_orders_customer_id index has been retained as it is necessary for scalability and ad hoc OLTP queries.
 
-There is also updates and inserts on database:
+There are also DML queries that give load on DB:
+
+```sql
+UPDATE test_lock SET val = $1 WHERE id = $2;
+```
+
+!Screenshot 2026-06-24 at 16.08.44.png
 
 ```sql
 UPDATE customer_events_wide
@@ -327,6 +333,16 @@ attr_03 = $3,
 attr_04 = $4
 WHERE customer_id = $5
 ```
+
+!Screenshot 2026-06-24 at 16.09.17.png
+
+```sql
+UPDATE customers
+SET phone = $1 || NOW()::TEXT
+WHERE customer_id = $2
+```
+
+!Screenshot 2026-06-24 at 16.10.00.png
 
 ```sql
 INSERT INTO customer_events_wide
@@ -346,17 +362,7 @@ $20, $21, $22, $23, $24
 )
 ```
 
-```sql
-UPDATE customers
-SET phone = $1 || NOW()::TEXT
-WHERE customer_id = $2
-```
-
-```sql
-INSERT INTO orders
-(customer_id, order_date, status, total_amount, payment_method, delivery_city)
-VALUES ($1, $2::timestamp, $3, $4, $5, $6)
-```
+!Screenshot 2026-06-24 at 16.10.27.png
 
 ```sql
 INSERT INTO order_items
@@ -364,47 +370,86 @@ INSERT INTO order_items
 VALUES ($1, $2, $3, $4)
 ```
 
-### Lock Contention and Table-Level Blocking (Bonus Section Evidence)
+!Screenshot 2026-06-24 at 16.11.14.png
 
-- **Detection Evidence:** Monitoring active sessions via pg_stat_activity combined with pg_blocking_pids() exposed an explicit block contention scenario on the `orders` table during concurrent workload execution:
+```sql
+INSERT INTO orders
+(customer_id, order_date, status, total_amount, payment_method, delivery_city)
+VALUES ($1, $2::timestamp, $3, $4, $5, $6)
+```
 
-!Screenshot 2026-06-21 at 16.39.03.png
+!Screenshot 2026-06-24 at 16.12.37.png
 
-- **Root Cause:** Transaction PID 22705 explicitly acquired a heavy `SHARE ROW EXCLUSIVE` lock on the `orders` table. This high-level lock completely blocks any concurrent DML operations (like `INSERT` or `UPDATE` from pipeline transactions). As a result, operational process PID 22708 is forced into a synchronous wait state, heavily spiking the system's execution latency and risking a timeout exception after 20 seconds.
-- **Resolution Strategy:** Avoid explicit table-level locks (`LOCK TABLE`) in application code. Rely strictly on row-level optimistic locking or fine-grained constraints. Ensure all transactions altering the `orders` table are short-lived, committing immediately after execution to keep row-exclusive locking duration under sub-millisecond thresholds.
+### Issue 1: High-Frequency Single-Row Operations (Write Amplification)
 
-### Issue 1: High-Frequency Row-by-Row Inserts (Write Amplification)
+**Empirical Evidence (`pg_stat_statements`):**
 
-- **Empirical Evidence (`pg_stat_statements`):** * `INSERT INTO order_items` -> **720,107 calls**
-    - `UPDATE customers` -> **1,176,818 calls**
-- **Analysis:** The application executes hundreds of thousands of isolated single-row operations in loops. Every single call creates network round-trip overhead and forces discrete Write-Ahead Log (WAL) disk flushes, creating severe I/O bottlenecks.
-- **Resolution Strategy:** Refactor application persistence layer to utilize **Batching (Bulk Inserts)**. Grouping inserts into batches of 1,000 rows (e.g., `INSERT INTO order_items VALUES (...), (...);`) reduces transaction log sync operations by 99.9%.
+- `INSERT INTO order_items` -> 720,107 calls
+- `UPDATE customers` -> 1,176,818 calls
+
+**Analysis:**
+
+Row-by-row execution in loops creates severe network and I/O bottlenecks due to constant Write-Ahead Log (WAL) disk flushes. Furthermore, the massive volume of single-row `UPDATE` queries causes heavy MVCC overhead, forcing PostgreSQL to continuously write new data pages and rewrite indexes.
+
+**Resolution Strategy:**
+
+1. **Application-Level Batching:** Refactor the codebase to utilize Bulk Inserts (grouping 1,000+ rows per statement). This cuts network round-trips and WAL sync operations by 99.9%.
+2. **Asynchronous Commit:** Apply `SET synchronous_commit = off;` for ingestion pipelines. This allows PostgreSQL to acknowledge writes from RAM instantly without waiting for physical disk flushes, massively accelerating bulk inserts (viable if a sub-second data loss during a hard server crash is acceptable).
+3. **Enable HOT Updates:** Execute `ALTER TABLE customers SET (fillfactor = 90);`. Leaving 10% free space on data pages allows PostgreSQL to update rows "in place" without rewriting indexes, drastically reducing I/O overhead.
 
 ### Issue 2: `Idle in Transaction` Bottlenecks & Lock Contention
 
 - **Empirical Evidence (`pg_stat_activity`):**
 
- `pid  |    usename    |        state        |         query
-------+---------------+---------------------+-------------------------------------
-42893 | darynaburdak  | idle in transaction | UPDATE customers SET status = 'active' WHERE customer_id = 3;
-43096 | darynaburdak  | idle in transaction | UPDATE customers SET city = city WHERE customer_id = 4;`
-
+| **pid** | **usename** | **state** | **query** |
+| --- | --- | --- | --- |
+| 42893 | darynaburdak | idle in transaction | `UPDATE customers SET status = 'active' WHERE customer_id = 3;` |
+| 43096 | darynaburdak | idle in transaction | `UPDATE customers SET city = city WHERE customer_id = 4;` |
 - **Root Cause Analysis:** Transactions opened by user `darynaburdak` issued `UPDATE` statements but remained uncommitted (`idle in transaction`). While in this state, PostgreSQL indefinitely holds an exclusive row-level lock (`RowExclusiveLock`) on `customer_id = 3` and `customer_id = 4`. This completely blocks any concurrent application threads trying to modify these customers, spiking queue duration. Furthermore, it holds back the global `xmin` horizon, preventing `VACUUM` from purging dead tuples and causing severe table bloat.
 - **Resolution Strategy:** 1. Strict application-layer control ensuring all code blocks wrapped in transactions guarantee a `COMMIT` or `ROLLBACK` in a `finally` block.
 2. Implement database-level safety rails: `SET idle_in_transaction_session_timeout = '10s';` to automatically kill abandoned connections and release acquired locks.
 
-### Issue 3: Live Lock Contention and Latency Degradation (Bonus Section Evidence)
+### Issue 3: Live Lock Contention and Table-Level Blocking (Bonus Section Evidence)
 
-- **Detection Methodology:** Combined analysis using `pg_blocking_pids()` to isolate the blocking tree, and a targeted query on `pg_stat_activity` filtered by `wait_event_type = 'Lock'` to measure live performance degradation.
-- **Empirical Evidence & Monitoring Metrics:**
-    1. **Lock Tree Mapping:**
-        - `Blocking PID 22705` (User: `darynaburdak`) executed: `LOCK TABLE orders IN SHARE ROW EXCLUSIVE MODE`
-        - `Blocked PID 22708` (User: `darynaburdak`) executed: `SET lock_timeout = '20s'; ...`
-    2. **Active Wait State Metrics:**
-        - `wait_event_type`: `Lock`
-        - `wait_event`: `relation` (Table-level lock constraint)
-        - `running_for`: `11.11 seconds` (Active accumulated delay)
-- **Root Cause Analysis:** The transaction layer initiated an explicit high-level `SHARE ROW EXCLUSIVE` lock on the entire `orders` relation. This completely paralyzed concurrent DML operations. The operational thread (PID 22708) was forced into a synchronous wait state, experiencing an artificial latency spike of over 11 seconds. This introduces an immediate risk of connection pool exhaustion and transaction timeout exceptions once the 20-second threshold is crossed.
-- **Resolution Strategy:** 1. Completely ban explicit table-level locking (`LOCK TABLE`) within application workflows.
-2. Shift to low-impact row-level locks or application-level optimistic lock controls.
-3. Decouple heavy transaction initializations from the active DB connection lifecycle to ensure lock hold duration never exceeds sub-millisecond limits.
+**Detection Methodology & Empirical Evidence:**
+
+Monitoring active sessions via `pg_stat_activity` combined with `pg_blocking_pids()` exposed an explicit block contention scenario on the `orders` table during concurrent workload execution.
+
+*Lock Tree Mapping:*
+
+- **Blocking PID 22705** (User: darynaburdak) executed: `LOCK TABLE orders IN SHARE ROW EXCLUSIVE MODE`
+- **Blocked PID 22708** (User: darynaburdak) executed: `SET lock_timeout = '20s'; ...`
+
+!Screenshot 2026-06-21 at 16.39.03.png
+
+*Active Wait State Metrics:*
+
+- `wait_event_type`: Lock
+- `wait_event`: relation (Table-level lock constraint)
+- `running_for`: 11.11 seconds (Active accumulated delay)
+
+**Root Cause Analysis:**
+
+The severe latency spike was caused by Transaction PID 22705 acquiring a heavy `SHARE ROW EXCLUSIVE` lock on the entire `orders` table. It is crucial to note that such high-level table locks do not occur naturally from standard DML operations (like regular `INSERT` or `UPDATE` queries). This explicit `LOCK TABLE` command was deliberately executed by the load-generator script to simulate a severe contention scenario for testing purposes.
+
+Because of this intentional roadblock, the operational process (PID 22708) attempting normal DML operations was forced into a synchronous wait state, experiencing an artificial latency spike of over 11 seconds. This introduces an immediate risk of connection pool exhaustion and transaction timeout exceptions once the 20-second threshold is crossed.
+
+**Resolution Strategy:**
+
+1. **Ban Explicit Table Locks:** Completely avoid explicit table-level locking (`LOCK TABLE`) within application workflows.
+2. **Use Fine-Grained Locking:** Shift to low-impact row-level locks (`SELECT ... FOR UPDATE`) or application-level optimistic lock controls.
+3. **Minimize Lock Duration:** Decouple heavy transaction initializations from the active DB connection lifecycle. Ensure all transactions altering mission-critical tables are short-lived, committing immediately after execution to keep lock hold durations strictly under sub-millisecond limits.
+
+## To check:
+
+**Ensure Visibility Map Accuracy for Index-Only Scans:** While the new B-Tree index enables a highly efficient Index-Only Scan, its actual runtime performance relies entirely on an up-to-date **Visibility Map**. Given the massive volume of concurrent `INSERT` operations on the `order_items` table (over 720,000 calls observed), the default global `autovacuum` schedule will lag behind. An outdated Visibility Map forces PostgreSQL to perform expensive **Heap Fetches** to verify MVCC row visibility, completely negating the performance benefits of the Index-Only Scan.
+
+To prevent this we must configure aggressive, table-specific autovacuum thresholds:
+
+```sql
+ALTER TABLE order_items SET (
+    autovacuum_vacuum_scale_factor = 0.05,
+    autovacuum_analyze_scale_factor = 0.05,
+    autovacuum_vacuum_insert_scale_factor = 0.05
+);
+```
